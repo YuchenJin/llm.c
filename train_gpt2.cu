@@ -579,8 +579,8 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     }
 
     // both GPT-2 and GPT-3 use the same tokenizer with 50257 tokens
-    model->config.vocab_size = 50257;
-    model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
+    model->config.vocab_size = 128001;
+    model->config.padded_vocab_size = 128128; // padded to 128 for CUDA kernel efficiency
 
     gpt2_allocate_weights(model);
 
@@ -1212,8 +1212,8 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     int state_header[256];
     memset(state_header, 0, sizeof(state_header));
     // basic identifying information
-    state_header[0] = 20240527; // magic number
-    state_header[1] = 1; // version number
+    state_header[0] = 20240801; // magic number
+    state_header[1] = 7; // version number
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
@@ -1251,8 +1251,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     FILE *state_file = fopenCheck(filename, "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
-    assert(state_header[0] == 20240527); // magic number
-    assert(state_header[1] == 1); // version number
+    assert(state_header[0] == 20240801); // magic number
+    assert(state_header[1] == 7); // version number
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
     int use_master_weights = state_header[4];  // whether we're using fp32 master weights
@@ -1625,7 +1625,7 @@ int main(int argc, char *argv[]) {
 
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
-    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char* hellaswag_path = "dev/data/hellaswag_llama/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
@@ -1660,7 +1660,7 @@ int main(int argc, char *argv[]) {
 
     // set up the Tokenizer
     Tokenizer tokenizer;
-    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+    tokenizer_init(&tokenizer, "llama3_tokenizer.bin");
 
     // set up learning rate scheduler
     LearningRateScheduler lr_scheduler;

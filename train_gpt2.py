@@ -33,6 +33,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.distributed as dist
+from transformers import AutoTokenizer
+
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -506,20 +508,23 @@ def write_state(model, x, y, logits, loss, filename):
         write_tensors(grads, model.config.n_layer, file, "float32")
     print(f"wrote {filename}")
 
-def write_tokenizer(enc, filename):
-    n = enc.max_token_value + 1
+def write_tokenizer(tokenizer, eot, filename):
+    n = 128001
     header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240328 # magic
+    header[0] = 20240822 # magic
     header[1] = 2 # tokenizer version = 2 (1 -> 2: includes EOT token)
     header[2] = n # number of tokens
-    header[3] = enc.eot_token # EOT token
+    header[3] = eot  # EOT token
+    normal_token_ids = [i for i in range(tokenizer.vocab_size) 
+                        if i not in tokenizer.all_special_ids]
     with open(filename, "wb") as file:
         file.write(header.numpy().tobytes())
         for i in range(n):
-            b = enc.decode_bytes([i])
+            token = tokenizer.convert_ids_to_tokens(i)
+            b = token.encode('utf-8')
             length = len(b)
-            assert length < 256, f"Token length exceeds 255: {length}"
-            file.write(struct.pack("<B", length))  # Write the length as a 1-byte unsigned integer
+            assert length < 65536, f"Token length exceeds 65535: {length}"
+            file.write(struct.pack("<H", length))  # Write the length as a 1-byte unsigned integer
             file.write(b)  # Write the actual bytes
     print(f"wrote {filename}")
 
@@ -644,9 +649,10 @@ if __name__ == "__main__":
     FLASH = args.flash
 
     # init (and write) the tokenizer
-    enc = tiktoken.get_encoding("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+    eot = tokenizer.encode('')[0]
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
-        write_tokenizer(enc, "gpt2_tokenizer.bin")
+        write_tokenizer(tokenizer, eot, "llama3_tokenizer.bin")
 
     # init the model, either from scratch or from OpenAI pretrained checkpoint
     if args.model[0] == "d":

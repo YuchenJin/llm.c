@@ -35,11 +35,12 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import GPT2LMHeadModel
 from data_common import download_file, write_evalfile
+from transformers import GPT2LMHeadModel
+from transformers import AutoTokenizer
 
 # -----------------------------------------------------------------------------
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
+DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag_llama")
 
 hellaswags = {
     "train": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_train.jsonl",
@@ -47,7 +48,9 @@ hellaswags = {
     "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
 }
 
-enc = tiktoken.get_encoding("gpt2")
+# enc = tiktoken.get_encoding("gpt2")
+enc = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+# enc = lambda s: tokenizer.encode(s, add_special_tokens=False, verbose=False, split_special_tokens=True)
 
 def download(split):
     """Downloads HellaSwag DATA_CACHE_DIR"""
@@ -84,7 +87,8 @@ def render_example(example):
     tok_rows = []
     mask_rows = []
     for end in endings:
-        end_tokens = enc.encode(" " + end) # note: prepending " " because GPT-2 tokenizer
+        # end_tokens = enc.encode(" " + end) # note: prepending " " because GPT-2 tokenizer
+        end_tokens = enc.encode(end) # note: prepending " " because GPT-2 tokenizer
         tok_rows.append(ctx_tokens + end_tokens)
         mask_rows.append([0]*len(ctx_tokens) + [1]*len(end_tokens))
         data["ending_tokens"].append(end_tokens)
@@ -113,6 +117,7 @@ def evaluate(model_type, device):
     torch.set_float32_matmul_precision('high') # use tf32
 
     model = GPT2LMHeadModel.from_pretrained(model_type)
+    model.resize_token_embeddings(len(enc))
     model.to(device)
     # model = torch.compile(model)
 

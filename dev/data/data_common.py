@@ -82,11 +82,11 @@ def write_evalfile(filename, datas):
     # now write the individual examples
     longest_example_bytes = 0 # in units of uint16s
     full_stream = [] # the stream of uint16s, we'll write a single time at the end
-    assert len(datas) < 2**16, "too many examples?"
+    assert len(datas) < 2**32, "too many examples?"
     for idx, data in enumerate(datas):
         stream = []
         # header of the example
-        stream.append(2**16-1) # <START_EXAMPLE>
+        stream.append(2**32-1) # <START_EXAMPLE>
         stream.append(0) # <EXAMPLE_BYTES> (fill in later)
         stream.append(idx) # <EXAMPLE_INDEX>
         stream.append(data["label"]) # <LABEL>
@@ -95,22 +95,22 @@ def write_evalfile(filename, datas):
         stream.append(len(ending_tokens)) # <NUM_COMPLETIONS>
         # the (shared) context tokens
         ctx_tokens = data["ctx_tokens"]
-        assert all(0 <= t < 2**16-1 for t in ctx_tokens), "bad context token"
+        assert all(0 <= t < 2**32-1 for t in ctx_tokens), "bad context token"
         stream.append(len(ctx_tokens))
         stream.extend(ctx_tokens)
         # the completion tokens
         for end_tokens in ending_tokens:
-            assert all(0 <= t < 2**16-1 for t in end_tokens), "bad completion token"
+            assert all(0 <= t < 2**32-1 for t in end_tokens), "bad completion token"
             stream.append(len(end_tokens))
             stream.extend(end_tokens)
         # write to full stream
-        nbytes = len(stream)*2 # 2 bytes per uint16
-        assert nbytes < 2**16, "example too large?"
+        nbytes = len(stream)*4 # 2 bytes per uint16
+        assert nbytes < 2**32, "example too large?"
         stream[1] = nbytes # fill in the <EXAMPLE_BYTES> field
         longest_example_bytes = max(longest_example_bytes, nbytes)
         full_stream.extend(stream)
     # construct the numpy array
-    stream_np = np.array(full_stream, dtype=np.uint16)
+    stream_np = np.array(full_stream, dtype=np.uint32)
     # fill in the longest_example field
     assert 0 < longest_example_bytes < 2**16, f"bad longest_example"
     header[3] = longest_example_bytes
