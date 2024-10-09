@@ -60,6 +60,7 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/fused_classifier.cuh"
 // defines: adamw_kernel3
 #include "llmc/adamw.cuh"
+#include "llmc/orthogonal_nesterov.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
 // ----------- Multi-GPU support -----------
@@ -282,6 +283,7 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
     return acts_memory;
 }
 
+
 typedef struct {
     GPT2Config config;
     // the weights of the model, and their sizes
@@ -298,6 +300,9 @@ typedef struct {
     float* m_memory;
     float* v_memory;
     float* master_weights;     // is NULL unless fp32 weights is enabled.
+    // buffers for the OrthogonalNesterov optimizer
+    OrthogonalNesterov orth_opt;
+    floatX* orth_m_memory;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
@@ -341,6 +346,7 @@ void gpt2_init_common(GPT2 *model) {
     // memory lazily initialized in update()
     model->m_memory = NULL;
     model->v_memory = NULL;
+    model->orth_m_memory = NULL;
     model->master_weights = NULL;
     // other default settings
     model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
@@ -348,6 +354,7 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    orthogonal_nesterov_init(&model->orth_opt, 0.1f, 0.95f, 5);
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -391,16 +398,21 @@ void gpt2_allocate_state(GPT2 *model, int B, int T) {
     // cudaMallocConditionallyManaged can fall back to cudaMallocManaged if not enough memory on device
     // and returns a status code of 1 if it had to fall back, in that case we want to print warning.
     int memory_status = 0;
+    
+    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+    size_t adamw_params = model->param_elements[0];
+    size_t orthogonal_nesterov_params = shard_num_parameters - adamw_params;
 
-    // we will now init the optimizer states and master weights
-    // this is usually a substantial amount of memory allocation right here.
-    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters; // num parameters we are responsible for
-    printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-    printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+    printf0("allocating %zu MiB for AdamW optimizer state m\n", (adamw_params * sizeof(float)) >> 20);
+    printf0("allocating %zu MiB for AdamW optimizer state v\n", (adamw_params * sizeof(float)) >> 20);
     assert(model->m_memory == nullptr);
     assert(model->v_memory == nullptr);
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, shard_num_parameters * sizeof(float));
-    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, shard_num_parameters * sizeof(float));
+    memory_status |= cudaMallocConditionallyManaged((void**)&model->m_memory, adamw_params * sizeof(float));
+    memory_status |= cudaMallocConditionallyManaged((void**)&model->v_memory, adamw_params * sizeof(float));
+
+    printf0("allocating %zu MiB for OrthogonalNesterov optimizer state m\n", (orthogonal_nesterov_params * sizeof(floatX)) >> 20);
+    assert(model->orth_m_memory == nullptr);
+    memory_status |= cudaMallocConditionallyManaged((void**)&model->orth_m_memory, orthogonal_nesterov_params * sizeof(floatX));
 
     if (model->use_master_weights == 1) {
         assert(model->master_weights == nullptr);
@@ -1034,14 +1046,8 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
                  MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
-    // update the model parameters using the AdamW optimizer
-    // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
-    // so we may not be responsible for the entire parameter tensor
-    // also, this function was very simple a while back but become very complex, only because we want to
-    // selectively weight decay some, but not all tensors :(
-    // TODO: revisit and probably refactor this entire function
     NVTX_RANGE_FN();
-    if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr) {
+    if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr || model->orth_m_memory == nullptr) {
         fprintf(stderr, "Need to allocate optimizer state before update");
         exit(EXIT_FAILURE);
     }
@@ -1050,71 +1056,64 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     if(init_state) {
         model->init_state = false;
         NvtxRange rng("InitOpt");
-        cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
-        cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+        cudaCheck(cudaMemset(model->m_memory, 0, model->param_elements[0] * sizeof(float)));
+        cudaCheck(cudaMemset(model->v_memory, 0, model->param_elements[0] * sizeof(float)));
+        cudaCheck(cudaMemset(model->orth_m_memory, 0, (multi_gpu_config->shard_num_parameters - model->param_elements[0]) * sizeof(floatX)));
     }
 
-    // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
     model->rng_state_last_update = model->rng_state;
 
-    // AdamW update
-    // handle adamw for all the transformer blocks
-    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        // generate a unique seed for each tensor
-        unsigned int seed = random_u32(&model->rng_state);
+    float adamw_lr = learning_rate;
+    float orthogonal_nesterov_lr = 0.1f * learning_rate;
+    size_t orth_offset = 0;
 
-        int num_layers = model->config.num_layers;
-        if((i < 2 || i > 13)) {
-            num_layers = 1;
-        }
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        unsigned int seed = random_u32(&model->rng_state);
 
         ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
         ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
         ptrdiff_t local_offset_full = tensor.offset + shard.offset;
         ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
 
-        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
-        // in particular this also decays the embedding weights, but this is ok:
-        // - the token embeddings are weight shared and participate in the final projection to logits
-        // - the position embeddings actively participate at every forward/backward pass
         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
-        float* m_ptr = model->m_memory + opt_state_offset;
-        float* v_ptr = model->v_memory + opt_state_offset;
         float* master_ptr = nullptr;
         if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
+
         if(init_state && model->master_weights != nullptr ) {
             size_t grid_size = CEIL_DIV(shard.size, 512);
-            copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
+            copy_and_cast_kernel<<<dim3(grid_size, 1), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
                                                                      shard.size, tensor.size);
             cudaCheck(cudaGetLastError());
         }
 
         if (init_from_master_only) {
-            // when resuming training from a checkpoint with master weights (allows changing precision)
-            init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
-        } else {
-            // ok finally call the kernel to update the weights with AdamW
+            init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, 1, seed, main_stream);
+        } else if (i == 0) {
             adamw_update(param_ptr, master_ptr, grad_ptr,
-                        m_ptr, v_ptr,
-                        shard.size, tensor.size, tensor.size, shard.size, num_layers,
-                        learning_rate,
-                        beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+                         model->m_memory, model->v_memory,
+                         shard.size, tensor.size, tensor.size, shard.size, 1,
+                         adamw_lr, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+        } else {
+            model->orth_opt.lr = orthogonal_nesterov_lr;
+            orthogonal_nesterov_step(&model->orth_opt, param_ptr, grad_ptr, 
+                                     model->orth_m_memory + orth_offset,
+                                     shard.size, main_stream);
+            if (i < NUM_PARAMETER_TENSORS - 1) {
+                orth_offset += model->param_elements[i+1];
+            }
         }
 
         if (multi_gpu_config->zero_stage == 1) {
 #if MULTI_GPU
             ncclCheck(ncclGroupStart());
-            for(int l = 0; l < num_layers; ++l) {
-                // gather updated shards of model->params_memory from each process
-                ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
-                                        (floatX*) model->params_memory + tensor.offset + l * tensor.size,
-                                        shard.size, ncclFloatX,
-                                        multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
-            }
+            ncclCheck(ncclAllGather(param_ptr,
+                                    (floatX*) model->params_memory + tensor.offset,
+                                    shard.size, ncclFloatX,
+                                    multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
             ncclCheck(ncclGroupEnd());
 #endif
         }
@@ -1122,6 +1121,97 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 
     cudaCheck(cudaDeviceSynchronize());
 }
+
+// void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
+//                  MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
+//     // update the model parameters using the AdamW optimizer
+//     // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
+//     // so we may not be responsible for the entire parameter tensor
+//     // also, this function was very simple a while back but become very complex, only because we want to
+//     // selectively weight decay some, but not all tensors :(
+//     // TODO: revisit and probably refactor this entire function
+//     NVTX_RANGE_FN();
+//     if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr) {
+//         fprintf(stderr, "Need to allocate optimizer state before update");
+//         exit(EXIT_FAILURE);
+//     }
+// 
+//     bool init_state = model->init_state;
+//     if(init_state) {
+//         model->init_state = false;
+//         NvtxRange rng("InitOpt");
+//         cudaCheck(cudaMemset(model->m_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+//         cudaCheck(cudaMemset(model->v_memory, 0, multi_gpu_config->shard_num_parameters * sizeof(float)));
+//     }
+// 
+//     // save RNG state at this point so we can round from master weights identically when restoring from a checkpoint
+//     model->rng_state_last_update = model->rng_state;
+// 
+//     // AdamW update
+//     // handle adamw for all the transformer blocks
+//     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+//         // generate a unique seed for each tensor
+//         unsigned int seed = random_u32(&model->rng_state);
+// 
+//         int num_layers = model->config.num_layers;
+//         if((i < 2 || i > 13)) {
+//             num_layers = 1;
+//         }
+// 
+//         ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
+//         ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+//         ptrdiff_t local_offset_full = tensor.offset + shard.offset;
+//         ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
+// 
+//         // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+//         // in particular this also decays the embedding weights, but this is ok:
+//         // - the token embeddings are weight shared and participate in the final projection to logits
+//         // - the position embeddings actively participate at every forward/backward pass
+//         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+//         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
+//         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
+// 
+//         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
+//         float* m_ptr = model->m_memory + opt_state_offset;
+//         float* v_ptr = model->v_memory + opt_state_offset;
+//         float* master_ptr = nullptr;
+//         if (model->master_weights != nullptr) { master_ptr = model->master_weights + opt_state_offset; }
+//         if(init_state && model->master_weights != nullptr ) {
+//             size_t grid_size = CEIL_DIV(shard.size, 512);
+//             copy_and_cast_kernel<<<dim3(grid_size, num_layers), 512, 0, main_stream>>>(master_ptr, param_ptr, shard.size,
+//                                                                      shard.size, tensor.size);
+//             cudaCheck(cudaGetLastError());
+//         }
+// 
+//         if (init_from_master_only) {
+//             // when resuming training from a checkpoint with master weights (allows changing precision)
+//             init_from_master(param_ptr, master_ptr, shard.size, tensor.size, shard.size, num_layers, seed, main_stream);
+//         } else {
+//             // ok finally call the kernel to update the weights with AdamW
+//             adamw_update(param_ptr, master_ptr, grad_ptr,
+//                         m_ptr, v_ptr,
+//                         shard.size, tensor.size, tensor.size, shard.size, num_layers,
+//                         learning_rate,
+//                         beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+//         }
+// 
+//         if (multi_gpu_config->zero_stage == 1) {
+// #if MULTI_GPU
+//             ncclCheck(ncclGroupStart());
+//             for(int l = 0; l < num_layers; ++l) {
+//                 // gather updated shards of model->params_memory from each process
+//                 ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
+//                                         (floatX*) model->params_memory + tensor.offset + l * tensor.size,
+//                                         shard.size, ncclFloatX,
+//                                         multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+//             }
+//             ncclCheck(ncclGroupEnd());
+// #endif
+//         }
+//     }
+// 
+//     cudaCheck(cudaDeviceSynchronize());
+// }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     /*
@@ -1157,6 +1247,7 @@ void gpt2_free(GPT2 *model) {
     cudaFreeCheck(&model->grads_memory);
     cudaFreeCheck(&model->m_memory);
     cudaFreeCheck(&model->v_memory);
+    cudaFreeCheck(&model->orth_m_memory);
     cudaFreeCheck(&model->master_weights);
     cudaFreeCheck(&model->acts_memory);
     cudaFreeCheck(&model->inputs);
