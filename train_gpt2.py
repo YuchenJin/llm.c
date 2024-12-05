@@ -23,6 +23,7 @@ import struct
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
+from demo import DeMo
 
 import numpy as np
 import torch
@@ -237,37 +238,6 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        print0(f"using fused AdamW: {use_fused}")
-        if zero_stage == 1:
-            print0("using ZeroRedundancyOptimizer")
-            optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
-                                                lr=learning_rate, betas=betas, fused=use_fused)
-            optimizer.add_param_group(optim_groups[1])
-        else:
-            print0("using regular AdamW")
-            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
-        return optimizer
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -559,6 +529,8 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    parser.add_argument("--demo_topk", type=int, default=32, help="DeMo top-k frequency components")
+    parser.add_argument("--demo_chunk", type=int, default=64, help="DeMo chunk size for DCT")
     # evaluation
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
@@ -705,12 +677,27 @@ if __name__ == "__main__":
     # here we wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+    raw_model = model.module if ddp else model
 
-    # init the optimizer
-    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
+    param_dict = {pn: p for pn, p in raw_model.named_parameters() if p.requires_grad}
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': args.weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+
+    # Create DeMo optimizer
+    optimizer = DeMo(
+        optim_groups,
+        compression_decay=0.999,
+        compression_topk=args.demo_topk,
+        compression_chunk=args.demo_chunk,
+        weight_decay=args.weight_decay,
+        process_group=None,
+        lr=args.learning_rate
+    )
+    # ---------------------------------------------------------------
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -796,27 +783,26 @@ if __name__ == "__main__":
             train_loader.reset()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
-        for micro_step in range(grad_accum_steps):
-            # fetch a batch
-            x, y = train_loader.next_batch()
-            x, y = x.to(device), y.to(device)
-            if ddp:
-                # we want only the last micro-step to sync grads in a DDP model
-                # the official way to do this is with model.no_sync(), but that is a
-                # context manager that bloats the code, so we just toggle this variable
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-            # forward pass
-            with ctx:
-                _, loss = model(x, y, return_logits=False)
-                # we have to scale the loss to account for gradient accumulation,
-                # because the gradients just add on each successive backward().
-                # addition of gradients corresponds to a SUM in the objective, but
-                # instead of a SUM we want MEAN, so we scale the loss here
-                loss = loss / grad_accum_steps
-                lossf += loss.detach() # keep track of the mean loss
-            # backward pass
-            if not args.inference_only:
-                loss.backward()
+
+        # Use no_sync() context to disable normal DDP gradient sync
+        with model.no_sync():
+            for micro_step in range(grad_accum_steps):
+                # fetch a batch
+                x, y = train_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                # forward pass
+                with ctx:
+                    _, loss = model(x, y, return_logits=False)
+                    # we have to scale the loss to account for gradient accumulation,
+                    # because the gradients just add on each successive backward().
+                    # addition of gradients corresponds to a SUM in the objective, but
+                    # instead of a SUM we want MEAN, so we scale the loss here
+                    loss = loss / grad_accum_steps
+                    lossf += loss.detach() # keep track of the mean loss
+                # backward pass
+                if not args.inference_only:
+                    loss.backward()
+
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
